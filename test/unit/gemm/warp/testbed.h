@@ -189,6 +189,7 @@ struct Testbed {
     tensor_C.reset(cutlass::make_Coord(Shape::kM, Shape::kN));
     tensor_D_computed.reset(cutlass::make_Coord(Shape::kM, Shape::kN));
     tensor_D_reference.reset(cutlass::make_Coord(Shape::kM, Shape::kN), false);
+
   }
 
   /// Returns true if the CUDA device is sufficient to execute the kernel.
@@ -674,19 +675,31 @@ __global__ void kernel_transform(
   CUTLASS_PRAGMA_NO_UNROLL
   for (int iter = 0; iter < iterations; ++iter) {     // place in loop that is not unrolled 
 
+    static constexpr bool is_B_4bit =
+        cutlass::sizeof_bits<typename Mma::ElementB>::value == 4;
+    static constexpr int kIncr = is_B_4bit ? 32 : Mma::Policy::MmaShape::kK;
     CUTLASS_PRAGMA_UNROLL
-    for (int k = 0; k < ThreadblockShape::kK;
-         k += Mma::Policy::MmaShape::kK) {
-      iter_A.load(loaded_frag_A);
+    for (int k = 0; k < ThreadblockShape::kK; k += kIncr) {
       iter_B.load(loaded_frag_B);
-
-      ++iter_A;
       ++iter_B;
 
-      mma.transform(transformed_frag_A, transformed_frag_B, loaded_frag_A,
-                    loaded_frag_B);
+      iter_A.load(loaded_frag_A);
+      ++iter_A;
+
+      mma.transform(transformed_frag_A, transformed_frag_B,
+                    loaded_frag_A, loaded_frag_B);
 
       mma(accum, transformed_frag_A, transformed_frag_B, accum);
+
+      if (is_B_4bit) {
+        iter_A.load(loaded_frag_A);
+        ++iter_A;
+
+        mma.transform(transformed_frag_A, transformed_frag_B,
+                      loaded_frag_A, loaded_frag_B);
+
+        mma(accum, transformed_frag_A, transformed_frag_B, accum);
+      }
     }
   }
   

@@ -81,6 +81,7 @@ template <
   int NumElementsInMmaFragment,
   /// Identifies A or B multiplicand
   Operand Operand_,
+  bool BLoFlag = true,
   ///
   typename Enable = void >
 struct FragmentShuffler {
@@ -122,6 +123,7 @@ struct FragmentShuffler <ElementMma_, ElementLoad_,
                          NumElementsInWarpFragment, 
                          NumElementsInMmaFragment,
                          Operand::kA,
+                         true,
                          typename platform::enable_if<(sizeof_bits<ElementMma_>::value == 16) &&
                                                  (sizeof_bits<ElementLoad_>::value == 8)>::type> {
 public:
@@ -205,6 +207,7 @@ struct FragmentShuffler <ElementMma_, ElementLoad_,
                          NumElementsInWarpFragment, 
                          NumElementsInMmaFragment,
                          Operand::kB,
+                         true,
                          typename platform::enable_if<(sizeof_bits<ElementMma_>::value == 16) &&
                                                  (sizeof_bits<ElementLoad_>::value == 8)>::type> {
 public:
@@ -259,6 +262,106 @@ public:
 
         // Reorder the data within the 32-bit word (4x8b) required for mma.sync
         dst_ptr[0] = __byte_perm(tmp0, tmp1, byte_selector_);
+    }
+
+    return result;
+  }
+
+};
+////////////////////////////////////////////////////////////////////////////////
+
+/// Partial specialization for `mma.sync` on 16b (F16/BF16) and `ldmatrix` on 4b (S4/U4)
+/// for operand B multiplicand going through upcasting. 
+template <
+  /// Element type for the operand in registers for the mma.sync
+  typename ElementMma_, 
+  /// Element type for the operand in shared memory for ldmatrix
+  typename ElementLoad_,
+  /// Number of mma.sync operations performed along rows or columns         
+  int NumMmaInstructions,
+  /// Number of elements in warp fragment
+  int NumElementsInWarpFragment,
+  /// Number of elements in mma fragment
+  int NumElementsInMmaFragment,
+  bool BLoFlag
+> 
+struct FragmentShuffler <ElementMma_, ElementLoad_,
+                         NumMmaInstructions, 
+                         NumElementsInWarpFragment, 
+                         NumElementsInMmaFragment,
+                         Operand::kB,
+                         BLoFlag,
+                         typename platform::enable_if<(sizeof_bits<ElementMma_>::value == 16) &&
+                                                 (sizeof_bits<ElementLoad_>::value == 4)>::type> {
+public:
+  using ElementMma = ElementMma_;
+  using ElementLoad = ElementLoad_;
+
+  static int const kNumMmaInstructions = NumMmaInstructions;
+  static int const kNumElementsInWarpFragment = NumElementsInWarpFragment;
+  static int const kNumElementsInMmaFragment = NumElementsInMmaFragment;
+  static Operand const kOperand = Operand::kB;
+
+  using WarpFragment = Array<ElementLoad, kNumElementsInWarpFragment>;
+  using MmaFragment = Array<ElementLoad, kNumElementsInMmaFragment>;
+  using SrcWarpFragment = Array<ElementLoad, 2 * kNumElementsInWarpFragment>;
+
+private:
+  int src_lane_0_, src_lane_1_;
+  uint32_t byte_selector_0_, byte_selector_1_, byte_selector_2_;
+
+public:
+  CUTLASS_DEVICE
+  FragmentShuffler() {
+    int lane_id = cutlass::arch::LaneId();
+    int mul;
+
+    src_lane_0_ = BLoFlag ? (lane_id & ~2) : (lane_id | 2);
+    src_lane_1_ = src_lane_0_ ^ 1;
+    mul = lane_id & 1;
+    byte_selector_0_ = (1 - mul) * 0x6240 + mul * 0x7351;
+    byte_selector_1_ = (1 - mul) * 0x7351 + mul * 0x6240;
+
+    mul = (lane_id & 2) >> 1;
+    uint32_t byte_selector_20_ = (1 - mul) * 0x5140 + mul * 0x7362;
+    uint32_t byte_selector_21_ = (1 - mul) * 0x1504 + mul * 0x3726;
+    mul = lane_id & 1;
+    byte_selector_2_ = (1 - mul) * byte_selector_20_ + mul * byte_selector_21_;
+  }
+
+  CUTLASS_DEVICE
+  WarpFragment operator()(SrcWarpFragment const &src) {
+
+    WarpFragment result;
+
+    MmaFragment const* mma_frag_src_ptr = reinterpret_cast<MmaFragment const *>(&src);
+    MmaFragment* mma_frag_dst_ptr = reinterpret_cast<MmaFragment *>(&result);
+
+    uint32_t const* src_ptr = reinterpret_cast<uint32_t const *>(&mma_frag_src_ptr[0]);
+    uint32_t* dst_ptr = reinterpret_cast<uint32_t *>(&mma_frag_dst_ptr[0]);
+
+    // The code assumes that twice more values than needed for a
+    // F16/BF16 MMA is loaded along contiguous dimension.  E.g. in the
+    // case of column major matrix: threads 0-3 would hold 32 elements
+    // of the first column in the warp fragment, threads 0-4 32
+    // elements of the second column, etc.; but only the first 16
+    // elements of each column will be used for the first MMA
+    // operation, and the last 16 elements will be used for the
+    // follow-up MMA operation.  This code distributes input values
+    // across threads so that either left (in case of row-major
+    // matrix) or upper (in case of column-major matrix) half of
+    // values are returned as result, depending on BLoFlag template
+    // argument.  The values are re-distributed between threads so
+    // that each value belongs to the proper thread for F16/BF16 MMA
+    // that will take place after the up-casting.
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int n = 0; n < WarpFragment::kElements / 8; n++) {
+      uint32_t tmp0 = __byte_perm(src_ptr[2 * n], src_ptr[2 * n + 1], byte_selector_0_);
+      uint32_t tmp1 = __byte_perm(src_ptr[2 * n], src_ptr[2 * n + 1], byte_selector_1_);
+      tmp0 = __shfl_sync(0xFFFFFFFF, tmp0, src_lane_0_);
+      tmp1 = __shfl_sync(0xFFFFFFFF, tmp1, src_lane_1_);
+      dst_ptr[n] = __byte_perm(tmp0, tmp1, byte_selector_2_);
     }
 
     return result;
@@ -412,10 +515,21 @@ public:
 
 public:
 
+  // Chosen so we get K=16 for int8 and K=32 for int4.
+  static constexpr int LoadInstructionM =
+      (sizeof_bits<ElementB>::value > sizeof_bits<ElementB>::value)
+      ? 8 * sizeof_bits<ElementB>::value / sizeof_bits<ElementA>::value
+      : InstructionShape::kM;
+
+  // Shape for loading data type from shared memory, accounting
+  // eventually for narrower ElementA.
+  using LoadInstructionShapeA =
+      GemmShape<LoadInstructionM, InstructionShape::kN, InstructionShape::kK>;
+
   /// Iterates over the A operand in Shared Memory
   using IteratorA = MmaTensorOpMultiplicandTileIterator<
      MatrixShape<Shape::kM, Shape::kK>, Operand::kA, ElementA, LayoutA,
-     MatrixShape<ArchMmaOperator::Shape::kM, ArchMmaOperator::Shape::kK>,
+     MatrixShape<LoadInstructionShapeA::kM, LoadInstructionShapeA::kK>,
      Policy::OpDelta::kRow, kThreadCount, kPartitionsK>;
 
   /// Storage for A tile in registers (loaded from Shared Memory)
@@ -428,18 +542,38 @@ public:
   /// Underlying arch::Mma instruction operand fragement for matrix A
   using MmaOperandA = typename ArchMmaOperator::FragmentA;
 
+  // Chosen so we get K=16 for int8 and K=32 for int4.
+  static constexpr int LoadInstructionK =
+      (sizeof_bits<ElementA>::value > sizeof_bits<ElementB>::value)
+      ? 8 * sizeof_bits<ElementA>::value / sizeof_bits<ElementB>::value
+      : InstructionShape::kK;
+
+  // Shape for loading data type from shared memory, accounting
+  // eventually for narrower ElementB.
+  using LoadInstructionShapeB =
+      GemmShape<InstructionShape::kM, InstructionShape::kN, LoadInstructionK>;
+
   /// Iterates over the B operand in Shared Memory
   using IteratorB = MmaTensorOpMultiplicandTileIterator<
       MatrixShape<Shape::kK, Shape::kN>, Operand::kB, ElementB, LayoutB,
-      MatrixShape<ArchMmaOperator::Shape::kK, ArchMmaOperator::Shape::kN>,
+      MatrixShape<LoadInstructionShapeB::kK, LoadInstructionShapeB::kN>,
       Policy::OpDelta::kRow, kThreadCount, kPartitionsK>;
 
   /// Storage for B tile in registers (loaded from Shared Memory)
   using FragmentB = typename IteratorB::Fragment;
 
+  // Chosen so we get K=16 for int8 and K=32 for int4.
+  static constexpr int ShuffledFragmentBKElements =
+      (sizeof_bits<ElementB>::value == 4)
+      ? FragmentB::kElements / 2
+      : FragmentB::kElements;
+
+  /// Storage for shuffled B tile in registers
+  using ShuffledFragmentB = Array<ElementB, ShuffledFragmentBKElements>;
+
   /// Storage for transformed B tile in registers (for use in Mma instruction)
   using TransformedFragmentB =
-      Array<MmaElementB, FragmentB::kElements>;
+      Array<MmaElementB, ShuffledFragmentB::kElements>;
 
   /// Underlying arch::Mma instruction operand fragement for matrix B
   using MmaOperandB = typename ArchMmaOperator::FragmentB;
@@ -523,13 +657,28 @@ public:
                  FragmentA const &A, FragmentB const &B) const {
 
     // Shuffle data within warp to obtain the mma.sync operand layout
-    detail::FragmentShuffler<MmaElementB, ElementB, MmaIterations::kColumn, 
-             FragmentB::kElements, MmaOperandB::kElements, Operand::kB> shuffler_B;
-    FragmentB tmp_B; 
-    tmp_B = shuffler_B(B);
+    ShuffledFragmentB tmp_B;
+    if constexpr (sizeof_bits<ElementB>::value == 4) {
+      if (b_lo_flag_) {
+        detail::FragmentShuffler<MmaElementB, ElementB, MmaIterations::kColumn, 
+                 ShuffledFragmentB::kElements, MmaOperandB::kElements, Operand::kB,
+                 true> shuffler_B;
+        tmp_B = shuffler_B(B);
+      } else {
+        detail::FragmentShuffler<MmaElementB, ElementB, MmaIterations::kColumn, 
+                 ShuffledFragmentB::kElements, MmaOperandB::kElements, Operand::kB,
+                 false> shuffler_B;
+        tmp_B = shuffler_B(B);
+      }
+      b_lo_flag_ = !b_lo_flag_;
+    } else {
+      detail::FragmentShuffler<MmaElementB, ElementB, MmaIterations::kColumn, 
+               ShuffledFragmentB::kElements, MmaOperandB::kElements, Operand::kB> shuffler_B;
+      tmp_B = shuffler_B(B);
+    }
 
     // Convert the B operand to the Mma Instruction operand type
-    detail::FragmentConverter<MmaElementB, ElementB, FragmentB::kElements> convert_B;
+    detail::FragmentConverter<MmaElementB, ElementB, ShuffledFragmentB::kElements> convert_B;
     dst_B = convert_B(tmp_B);
 
     FragmentA tmp_A;
@@ -553,6 +702,9 @@ public:
 
     ptr_dst_A[1] = convert_A(ptr_tmp_A[1]);
   }
+
+private:
+  mutable bool b_lo_flag_ = true;
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

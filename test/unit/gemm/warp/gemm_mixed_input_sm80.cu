@@ -324,4 +324,27 @@ TEST(SM80_warp_gemm_mixed_input_tensor_op_crosswise_i8_bf16, 64x64x64_64x64x64_1
       .run();
 }
 
+////////////////////////////////////////////////////////////////////////////////
+/// F32 <= F16 * I4 + F32 (Upcast on Operand B)
+////////////////////////////////////////////////////////////////////////////////
+TEST(SM80_warp_gemm_mixed_input_tensor_op_crosswise_f16_i4, 128x128x64_64x64x64_16x8x16) {
+  using Shape = cutlass::gemm::GemmShape<64, 64, 64>;
+  using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+  using ElementA = cutlass::half_t;
+  using ElementB = cutlass::int4b_t;
+  using ElementC = float;
+  using LayoutA = cutlass::layout::RowMajorTensorOpMultiplicandCrosswise<
+      cutlass::sizeof_bits<ElementA>::value, 64>;
+  using LayoutB = cutlass::layout::ColumnMajorTensorOpMultiplicandCrosswise<
+      cutlass::sizeof_bits<ElementB>::value, 64>;
+
+  using MmaTensorOp = typename cutlass::gemm::warp::DefaultMmaTensorOp<
+      Shape, InstructionShape, ElementA, LayoutA, ElementB, LayoutB, ElementC,
+      cutlass::layout::RowMajor, cutlass::arch::OpMultiplyAddMixedInputUpcast>::Type;
+
+  test::gemm::warp::TransformTestbed<MmaTensorOp,
+                            cutlass::gemm::GemmShape<128, 128, 64> >()
+      .run();
+}
+
 #endif // if defined(CUTLASS_ARCH_MMA_SM80_SUPPORTED)
