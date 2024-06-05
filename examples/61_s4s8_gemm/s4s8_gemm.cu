@@ -95,6 +95,16 @@
 /// GEMM kernel configurations (cutlass_tensorop_h16816gemm_128x128_32x4_nn_align8)
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+    // inputs
+    //     A           [M, K]    int8
+    //     B           [N, K]    int4
+    //     alphaCol    [M, 1]    fp32
+    //     alphaRow    [1, N]    fp32
+    // outputs
+    //     mat [M, N]            fp32
+
+    //  alphaCol* alphaRow * (A x B)
+
   // A matrix configuration
     using         ElementA         = int8_t;                                    // Element type for A matrix operand
     using         LayoutA          = cutlass::layout::RowMajor;                        // Layout type for A matrix operand
